@@ -3,75 +3,46 @@
 #ifndef __842_H__
 #define __842_H__
 
-/* The 842 compressed format is made up of multiple blocks, each of
- * which have the format:
+/**
+ * @brief
+ *  842压缩格式由多个块组成。每个块都是如下格式：
+ *      <template> [arg1] [arg2] [arg3] [arg4]
+ *  其中存在 0 - 4 个模板参数，具体取决于特定的模板操作。对于正常操作，
+ *  每个参数要么是添加到输出缓冲区的特定数据字节数，要么是指向要复制到输出缓冲区里
+ *  的先前写入的数据字节数的索引。
  *
- * <template>[arg1][arg2][arg3][arg4]
+ *  模板码的值是 5bit。这个值指示如何处理如下数据：
+ *      1. 0 - 0x19 应该使用模板表，即解压缩中使用的静态的 "decomp_ops"，对于每个模板(表行)，
+ *  有 1 到 4 个操作；每个动作对应于模板代码位后面的一个参数。每个动作要么是"data"型操作，要么
+ *  是 "索引" 型操作。每个动作结果都是2、4 或8个字节，并把他们写入到缓存区。每个模板(即表行中的所有操作)
+ *  将加起来最多 8 个字节写入输出缓存区。任何少于 4 个操作的行都会填充 "noop" 操作，由 N0 表示(压缩
+ *  数据缓冲区中没有相应的arg)
  *
- * where there are between 0 and 4 template args, depending on the specific
- * template operation.  For normal operations, each arg is either a specific
- * number of data bytes to add to the output buffer, or an index pointing
- * to a previously-written number of data bytes to copy to the output buffer.
+ *  表中由 D2、D4、D8表示的 "Data" 操作意味着压缩数据缓冲区中相应的 arg 分别是: 2字节、4字节或8字节，
+ *  应该直接复制到输出缓冲区。
  *
- * The template code is a 5-bit value.  This code indicates what to do with
- * the following data.  Template codes from 0 to 0x19 should use the template
- * table, the static "decomp_ops" table used in decompress.  For each template
- * (table row), there are between 1 and 4 actions; each action corresponds to
- * an arg following the template code bits.  Each action is either a "data"
- * type action, or a "index" type action, and each action results in 2, 4, or 8
- * bytes being written to the output buffer.  Each template (i.e. all actions
- * in the table row) will add up to 8 bytes being written to the output buffer.
- * Any row with less than 4 actions is padded with noop actions, indicated by
- * N0 (for which there is no corresponding arg in the compressed data buffer).
+ *  表中由 I2、I4、I8表示的 "Index" 操作意味着相应的 arg 是一个索引参数，分别指向输出缓冲区中已经存在的
+ *  2、4或8字节值，应该复制到输出缓冲区的末尾。本质上，索引指向环形缓冲区中的一个位置，该位置包含输出缓冲区
+ *  数据的最后N个字节。每个索引的arg位数位：I2为bits、I4为9bits、I8为8bits。由于每个索引指向一个2、4或8
+ *  字节的部分，这意味着 I2 可以引用 512字节((2 ^ 8bits = 256) * 2 bits)，I4可以引用2048字节((2 ^ 9 = 512) * 4字节)，
+ *  I8 可以引用 2048 bytes ((2 ^ 8 = 256) * 8bits)。可以将其视为 I2、I4和I8中每一个的一种环形缓冲区，
+ *  它们针对写入输出缓冲区的每个字节进行更新。在这个实现中，输出缓冲区直接用于每个索引；不需要额外的内存。请注意，
+ *  索引是进入环形缓冲区，而不是滑动窗口；例如，如果260个字节写入输出缓冲区，那么I2[0]将索引到输出缓冲区中的256字节，
+ *  而I2[16]则索引到输出缓冲区中的16字节。
  *
- * "Data" actions, indicated in the table by D2, D4, and D8, mean that the
- * corresponding arg is 2, 4, or 8 bytes, respectively, in the compressed data
- * buffer should be copied directly to the output buffer.
+ *  还有3个特殊的模板代码；0X1B 表示"重复"; 0X1C 表示"零"; 0X1E表示"结束"。
+ *  “重复”操作之后是一个6位 arg N，表示要重复多少次。写入输出缓冲器的最后 8 个字节再次写入输出缓冲器，N + 1次。
+ *  "零"操作没有 arg 位，将 8 个零写入输出缓冲区。
+ *  "结束"操作也没有arg位，表示压缩数据结束。
+ *  在结束操作位之后可能会有一些填充(通常是0)位，以将缓冲区长度填充到特定的字节倍数(通常位 8、16或32字节的倍数)。
  *
- * "Index" actions, indicated in the table by I2, I4, and I8, mean the
- * corresponding arg is an index parameter that points to, respectively, a 2,
- * 4, or 8 byte value already in the output buffer, that should be copied to
- * the end of the output buffer.  Essentially, the index points to a position
- * in a ring buffer that contains the last N bytes of output buffer data.
- * The number of bits for each index's arg are: 8 bits for I2, 9 bits for I4,
- * and 8 bits for I8.  Since each index points to a 2, 4, or 8 byte section,
- * this means that I2 can reference 512 bytes ((2^8 bits = 256) * 2 bytes), I4
- * can reference 2048 bytes ((2^9 = 512) * 4 bytes), and I8 can reference 2048
- * bytes ((2^8 = 256) * 8 bytes).  Think of it as a kind-of ring buffer for
- * each of I2, I4, and I8 that are updated for each byte written to the output
- * buffer.  In this implementation, the output buffer is directly used for each
- * index; there is no additional memory required.  Note that the index is into
- * a ring buffer, not a sliding window; for example, if there have been 260
- * bytes written to the output buffer, an I2 index of 0 would index to byte 256
- * in the output buffer, while an I2 index of 16 would index to byte 16 in the
- * output buffer.
+ *  次软件的实现还使用一个未定义的模板值 0X1D 作为特殊的"短数据"模板代码，以表示少于8字节的未压缩数据。
+ *  它后面是一个 3 位的 arg N，指示后面将有多少数据字节，然后是 N 字节的数据，这些数据应复制到输出缓冲区。
+ *  这允许软件在 842 压缩器接收不是 8 字节长的精确倍数的输入缓冲器。但是， 842 硬件解压缩器将拒绝包含此纯软件模板
+ *  的压缩缓冲区，并且必须使用此软件库进行解压缩。842软件压缩模块包含一个参数，用于禁用此仅限软件"短数据"模板，而只需拒绝任何
+ *  长度不是 8 字节倍数的输入缓冲区。
  *
- * There are also 3 special template codes; 0x1b for "repeat", 0x1c for
- * "zeros", and 0x1e for "end".  The "repeat" operation is followed by a 6 bit
- * arg N indicating how many times to repeat.  The last 8 bytes written to the
- * output buffer are written again to the output buffer, N + 1 times.  The
- * "zeros" operation, which has no arg bits, writes 8 zeros to the output
- * buffer.  The "end" operation, which also has no arg bits, signals the end
- * of the compressed data.  There may be some number of padding (don't care,
- * but usually 0) bits after the "end" operation bits, to fill the buffer
- * length to a specific byte multiple (usually a multiple of 8, 16, or 32
- * bytes).
- *
- * This software implementation also uses one of the undefined template values,
- * 0x1d as a special "short data" template code, to represent less than 8 bytes
- * of uncompressed data.  It is followed by a 3 bit arg N indicating how many
- * data bytes will follow, and then N bytes of data, which should be copied to
- * the output buffer.  This allows the software 842 compressor to accept input
- * buffers that are not an exact multiple of 8 bytes long.  However, those
- * compressed buffers containing this sw-only template will be rejected by
- * the 842 hardware decompressor, and must be decompressed with this software
- * library.  The 842 software compression module includes a parameter to
- * disable using this sw-only "short data" template, and instead simply
- * reject any input buffer that is not a multiple of 8 bytes long.
- *
- * After all actions for each operation code are processed, another template
- * code is in the next 5 bits.  The decompression ends once the "end" template
- * code is detected.
+ *  在处理每个操作代码的所有操作后，另一个模板代码位于接下来的5位。一旦监测到"结束"模板代码，解压缩就结束。
  */
 
 #include <linux/module.h>

@@ -98,6 +98,8 @@ modules.order
 !.gitignore
 !.mailmap
 
+compile_commands.json
+
 #
 # Generated include files
 #
